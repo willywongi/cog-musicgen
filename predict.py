@@ -4,6 +4,7 @@
 import os
 import random
 import time
+from tempfile import NamedTemporaryFile
 from typing import Optional
 from cog import BasePredictor, Input, Path
 import torch
@@ -84,20 +85,6 @@ class Predictor(BasePredictor):
         duration: int = Input(
             description="Duration of the generated audio in seconds.", default=8
         ),
-        continuation: bool = Input(
-            description="If `True`, generated music will continue from `input_audio`. Otherwise, generated music will mimic `input_audio`'s melody.",
-            default=False,
-        ),
-        continuation_start: int = Input(
-            description="Start time of the audio file to use for continuation.",
-            default=0,
-            ge=0,
-        ),
-        continuation_end: int = Input(
-            description="End time of the audio file to use for continuation. If -1 or None, will default to the end of the audio clip.",
-            default=None,
-            ge=0,
-        ),
         multi_band_diffusion: bool = Input(
             description="If `True`, the EnCodec tokens will be decoded with MultiBand Diffusion. Only works with non-stereo models.",
             default=False,
@@ -134,12 +121,9 @@ class Predictor(BasePredictor):
     ) -> Path:
         if prompt is None and input_audio is None:
             raise ValueError("Must provide either prompt or input_audio")
-        if continuation and not input_audio:
-            raise ValueError("Must provide `input_audio` if continuation is `True`.")
         if (
             (model_version == "stereo-large" or model_version == "large")
             and input_audio
-            and not continuation
         ):
             raise ValueError(
                 "`stereo-large` and `large` model does not support melody input. Set `model_version='stereo-melody-large'` or `model_version='melody-large'` to condition on audio input."
@@ -181,64 +165,65 @@ class Predictor(BasePredictor):
             set_all_seeds(seed)
         set_all_seeds(seed)
         print(f"Using seed {seed}")
+        segment_duration = 30
+
+        overlap = 5
 
         if not input_audio:
-            set_generation_params(duration)
-            wav, tokens = model.generate([prompt], progress=True, return_tokens=True)
-            if multi_band_diffusion:
-                wav = self.mbd.tokens_to_wav(tokens)
 
+            if duration <= segment_duration:
+                set_generation_params(duration)
+            else:
+                set_generation_params(segment_duration)
+
+            if multi_band_diffusion:
+                _, tokens = model.generate(descriptions=[prompt], progress=True, return_tokens=True)
+                segment = self.mbd.tokens_to_wav(tokens)
+            else:
+                segment = model.generate(descriptions=[prompt], progress=True)
+            duration -= segment_duration
+            while duration > 0:
+                last_sec = segment[:, :, -overlap * model.sample_rate:]
+                if multi_band_diffusion:
+                    _, tokens = model.generate_continuation(last_sec,
+                                                            model.sample_rate,
+                                                            descriptions=[prompt],
+                                                            return_tokens=True,
+                                                            progress=True)
+                    next_segment = self.mbd.tokens_to_wav(tokens)
+                else:
+                    next_segment = model.generate_continuation(last_sec,
+                                                               model.sample_rate,
+                                                               descriptions=[prompt],
+                                                               progress=True)
+                segment = torch.cat([segment[:, :, :-overlap * model.sample_rate], next_segment], 2)
+                duration -= segment_duration - overlap
+                if duration < segment_duration:
+                    segment_duration = duration + overlap
+                    set_generation_params(segment_duration)
         else:
             input_audio, sr = torchaudio.load(input_audio)
             input_audio = input_audio[None] if input_audio.dim() == 2 else input_audio
 
-            continuation_start = 0 if not continuation_start else continuation_start
-            if continuation_end is None or continuation_end == -1:
-                continuation_end = input_audio.shape[2] / sr
+            set_generation_params(duration)
+            segment, tokens = model.generate_with_chroma(
+                [prompt], input_audio, sr, progress=True, return_tokens=True
+            )
+            if multi_band_diffusion:
+                segment = self.mbd.tokens_to_wav(tokens)
 
-            if continuation_start > continuation_end:
-                raise ValueError(
-                    "`continuation_start` must be less than or equal to `continuation_end`"
-                )
-
-            input_audio_wavform = input_audio[
-                ..., int(sr * continuation_start) : int(sr * continuation_end)
-            ]
-
-            if continuation:
-                set_generation_params(duration)
-                wav, tokens = model.generate_continuation(
-                    prompt=input_audio_wavform,
-                    prompt_sample_rate=sr,
-                    descriptions=[prompt],
-                    progress=True,
-                    return_tokens=True,
-                )
-                if multi_band_diffusion:
-                    wav = self.mbd.tokens_to_wav(tokens)
-
-            else:
-                set_generation_params(duration)
-                wav, tokens = model.generate_with_chroma(
-                    [prompt], input_audio_wavform, sr, progress=True, return_tokens=True
-                )
-                if multi_band_diffusion:
-                    wav = self.mbd.tokens_to_wav(tokens)
-
-        audio_write(
-            "out",
-            wav[0].cpu(),
-            model.sample_rate,
-            strategy=normalization_strategy,
-        )
-        wav_path = "out.wav"
+        output = segment.detach().cpu().float()[0]
+        with NamedTemporaryFile("wb", suffix=".wav", delete=False) as wav_path:
+            audio_write(
+                wav_path.name, output, model.sample_rate, strategy=normalization_strategy,
+                loudness_headroom_db=16, loudness_compressor=True, add_suffix=False)
 
         if output_format == "mp3":
-            mp3_path = "out.mp3"
+            mp3_path = wav_path.parent() / f"{wav_path.stem}.mp3"
             if os.path.isfile(mp3_path):
                 os.remove(mp3_path)
-            subprocess.call(["ffmpeg", "-i", wav_path, mp3_path])
-            os.remove(wav_path)
+            subprocess.call(["ffmpeg", "-i", str(wav_path), mp3_path])
+            wav_path.unlink()
             path = mp3_path
         else:
             path = wav_path
